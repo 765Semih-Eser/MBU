@@ -6,91 +6,116 @@ import sqlite3
 import json
 import os
 import uuid
-from sentence_transformers import SentenceTransformer
+import re
 import ollama
+from sentence_transformers import SentenceTransformer
+from rank_bm25 import BM25Okapi
 
 # ---------------------------
-# BASE PATH
+# TOKENIZER
 # ---------------------------
+
+def tokenize(text):
+    text = str(text).lower()
+    text = re.sub(r"[^\w\sçğıöşü]", " ", text)
+    return text.split()
+
+
+# ---------------------------
+# PATHS
+# ---------------------------
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
 DB_PATH = os.path.join(BASE_DIR, "chat.db")
 
 VECTOR_DIR = os.path.join(BASE_DIR, "vectorstore")
-
 INDEX_PATH = os.path.join(VECTOR_DIR, "index.faiss")
 DATA_PATH = os.path.join(VECTOR_DIR, "data.pkl")
 
+
 # ---------------------------
-# CHECK VECTORSTORE
+# CHECK FILES
 # ---------------------------
+
 if not os.path.exists(INDEX_PATH):
-    st.error("index.faiss bulunamadı. Önce ingest.py çalıştır.")
+    st.error("index.faiss bulunamadı.")
     st.stop()
 
 if not os.path.exists(DATA_PATH):
-    st.error("data.pkl bulunamadı. Önce ingest.py çalıştır.")
+    st.error("data.pkl bulunamadı.")
     st.stop()
+
 
 # ---------------------------
 # MODEL
 # ---------------------------
+
 model = SentenceTransformer("all-MiniLM-L6-v2")
 
+
 # ---------------------------
-# LOAD FAISS
+# LOAD VECTOR STORE
 # ---------------------------
+
 index = faiss.read_index(INDEX_PATH)
 
 with open(DATA_PATH, "rb") as f:
     documents, metadata = pickle.load(f)
 
+
+# ---------------------------
+# BM25
+# ---------------------------
+
+tokenized_docs = [tokenize(doc) for doc in documents]
+bm25 = BM25Okapi(tokenized_docs)
+
+
 # ---------------------------
 # SQLITE
 # ---------------------------
+
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cursor = conn.cursor()
 
 cursor.execute("""
-CREATE TABLE IF NOT EXISTS chats (
-    chat_id TEXT PRIMARY KEY,
-    title TEXT
+CREATE TABLE IF NOT EXISTS chats(
+chat_id TEXT PRIMARY KEY,
+title TEXT
 )
 """)
 
 cursor.execute("""
-CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id TEXT,
-    role TEXT,
-    content TEXT,
-    sources TEXT
+CREATE TABLE IF NOT EXISTS messages(
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+chat_id TEXT,
+role TEXT,
+content TEXT,
+sources TEXT
 )
 """)
 
 conn.commit()
 
-# ---------------------------
-# FUNCTIONS
-# ---------------------------
-def save_message(chat_id, role, content, sources=None):
 
+# ---------------------------
+# DB FUNCTIONS
+# ---------------------------
+
+def save_message(chat_id, role, content, sources=None):
     cursor.execute("""
-    INSERT INTO messages
-    (chat_id, role, content, sources)
-    VALUES (?, ?, ?, ?)
+    INSERT INTO messages(chat_id, role, content, sources)
+    VALUES(?,?,?,?)
     """, (
         chat_id,
         role,
         content,
         json.dumps(sources) if sources else None
     ))
-
     conn.commit()
 
 
 def load_messages(chat_id):
-
     cursor.execute("""
     SELECT role, content, sources
     FROM messages
@@ -100,265 +125,294 @@ def load_messages(chat_id):
 
     rows = cursor.fetchall()
 
-    messages = []
-
+    out = []
     for r in rows:
-
-        messages.append({
+        out.append({
             "role": r[0],
             "content": r[1],
             "sources": json.loads(r[2]) if r[2] else None
         })
+    return out
 
-    return messages
 
-
-def create_chat(chat_id, title):
-
-    cursor.execute("""
-    INSERT OR IGNORE INTO chats
-    VALUES (?, ?)
-    """, (chat_id, title))
-
+def create_chat(cid, title):
+    cursor.execute("INSERT OR IGNORE INTO chats VALUES(?,?)", (cid, title))
     conn.commit()
 
 
 def get_chats():
-
-    cursor.execute("""
-    SELECT chat_id, title
-    FROM chats
-    """)
-
+    cursor.execute("SELECT chat_id, title FROM chats")
     return cursor.fetchall()
 
 
 # ---------------------------
-# INITIAL CHAT
+# INIT CHAT
 # ---------------------------
-db_chats = get_chats()
 
-if len(db_chats) == 0:
+db = get_chats()
 
-    first_id = str(uuid.uuid4())
+if len(db) == 0:
+    cid = str(uuid.uuid4())
+    create_chat(cid, "Yeni Sohbet")
+    db = get_chats()
 
-    create_chat(first_id, "Yeni Sohbet")
-
-    db_chats = [(first_id, "Yeni Sohbet")]
-
-# ---------------------------
-# SESSION
-# ---------------------------
 if "active_chat" not in st.session_state:
-
-    st.session_state.active_chat = db_chats[0][0]
-
-chat_ids = [c[0] for c in db_chats]
-
-if st.session_state.active_chat not in chat_ids:
-
-    st.session_state.active_chat = db_chats[0][0]
+    st.session_state.active_chat = db[0][0]
 
 chat_id = st.session_state.active_chat
+
 
 # ---------------------------
 # SIDEBAR
 # ---------------------------
+
 st.sidebar.title("Sohbetler")
 
-# Yeni sohbet
 if st.sidebar.button("➕ Yeni Sohbet"):
-
-    new_id = str(uuid.uuid4())
-
-    create_chat(new_id, "Yeni Sohbet")
-
-    st.session_state.active_chat = new_id
-
+    cid = str(uuid.uuid4())
+    create_chat(cid, "Yeni Sohbet")
+    st.session_state.active_chat = cid
     st.rerun()
 
-# Boş sohbet temizle
-if st.sidebar.button("🗑 Boş Sohbetleri Temizle"):
+for cid, title in get_chats():
+    c1, c2 = st.sidebar.columns([5, 1])
 
-    cursor.execute("""
-    DELETE FROM chats
-    WHERE title='Yeni Sohbet'
-    """)
-
-    conn.commit()
-
-    st.rerun()
-
-# Güncel chatler
-db_chats = get_chats()
-
-# Sohbet listesi
-for cid, title in db_chats:
-
-    col1, col2 = st.sidebar.columns([4, 1])
-
-    # sohbet aç
-    with col1:
-
-        if st.button(title, key=f"chat_{cid}"):
-
+    with c1:
+        if st.button(title, key=cid):
             st.session_state.active_chat = cid
-
             st.rerun()
 
-    # sohbet sil
-    with col2:
-
-        if st.button("❌", key=f"del_{cid}"):
-
-            cursor.execute(
-                "DELETE FROM messages WHERE chat_id=?",
-                (cid,)
-            )
-
-            cursor.execute(
-                "DELETE FROM chats WHERE chat_id=?",
-                (cid,)
-            )
-
+    with c2:
+        if st.button("❌", key=f"del{cid}"):
+            cursor.execute("DELETE FROM messages WHERE chat_id=?", (cid,))
+            cursor.execute("DELETE FROM chats WHERE chat_id=?", (cid,))
             conn.commit()
-
-            remaining = get_chats()
-
-            if remaining:
-
-                st.session_state.active_chat = remaining[0][0]
-
-            else:
-
-                new_id = str(uuid.uuid4())
-
-                create_chat(new_id, "Yeni Sohbet")
-
-                st.session_state.active_chat = new_id
-
             st.rerun()
 
+
 # ---------------------------
-# MAIN UI
+# CHAT UI
 # ---------------------------
+
 st.title("🎓 Üniversite RAG Asistanı")
 
 messages = load_messages(chat_id)
 
-# mesajlar
 for msg in messages:
-
-    if msg["role"] == "user":
-
-        st.markdown(f"### 👤 Sen")
-        st.write(msg["content"])
-
-    else:
-
-        st.markdown(f"### 🤖 Asistan")
+    with st.chat_message(msg["role"]):
         st.write(msg["content"])
 
         if msg["sources"]:
-
-            with st.expander("📌 Kaynaklar"):
-
+            with st.expander("Kaynaklar"):
                 for s in msg["sources"]:
+                    st.write(f"{s['source']} | Sayfa:{s['page']} | Tür:{s['type']}")
 
-                    st.write(
-                        f"""
-                        • {s['source']}
-                        | Sayfa: {s['page']}
-                        | Tür: {s['type']}
-                        """
-                    )
 
 # ---------------------------
 # INPUT
 # ---------------------------
-with st.form("chat_form", clear_on_submit=True):
 
-    query = st.text_input("Sorunu yaz")
+query = st.chat_input("Sorunuzu yaz")
 
-    submit = st.form_submit_button("Gönder")
 
 # ---------------------------
-# RAG
+# RAG PIPELINE
 # ---------------------------
-if submit and query:
 
-    # chat title
-    cursor.execute(
-        "SELECT title FROM chats WHERE chat_id=?",
-        (chat_id,)
-    )
+if query and query.strip():
 
-    current_title = cursor.fetchone()[0]
+    query = query.strip()
 
-    if current_title == "Yeni Sohbet":
+    # chat title update
+    cursor.execute("SELECT title FROM chats WHERE chat_id=?", (chat_id,))
+    row = cursor.fetchone()
 
-        new_title = query[:35]
-
+    if row and row[0] == "Yeni Sohbet":
         cursor.execute(
             "UPDATE chats SET title=? WHERE chat_id=?",
-            (new_title, chat_id)
+            (query[:40], chat_id)
         )
-
         conn.commit()
 
-    # embedding
-    q_vec = model.encode([query])
+    save_message(chat_id, "user", query)
 
-    D, I = index.search(np.array(q_vec), k=5)
+
+    # ---------------------------
+    # FILTER
+    # ---------------------------
+
+    query_lower = query.lower()
+    filter_type = None
+
+    for w in ["vize", "final", "büt", "sınav", "tarih", "ne zaman"]:
+        if w in query_lower:
+            filter_type = "takvim"
+            break
+
+
+    # ---------------------------
+    # RETRIEVAL
+    # ---------------------------
+
+    q_emb = model.encode([query], normalize_embeddings=True)
+    q_emb = np.array(q_emb).astype("float32")
+
+    D, I = index.search(q_emb, 15)
+
+    bm25_scores = bm25.get_scores(tokenize(query))
+
+    combined = []
+
+    for score, idx in zip(D[0], I[0]):
+
+        if idx == -1 or idx >= len(metadata):
+            continue
+
+        meta = metadata[idx]
+
+        if filter_type and meta.get("type") != filter_type:
+            continue
+
+        semantic = 1 / (1 + float(score))
+
+        keyword = float(bm25_scores[idx])
+        keyword = keyword / (keyword + 1e-6)
+
+        final_score = 0.75 * semantic + 0.25 * keyword
+
+        combined.append((idx, final_score))
+
+
+    # ---------------------------
+    # SORT
+    # ---------------------------
+
+    combined = sorted(combined, key=lambda x: x[1], reverse=True)
+
+
+    # ---------------------------
+    # DIVERSITY FILTER
+    # ---------------------------
+
+    q_tokens = set(tokenize(query))
+
+    filtered = []
+
+    for idx, sc in combined:
+
+        doc_tokens = set(tokenize(documents[idx]))
+
+        if len(q_tokens.intersection(doc_tokens)) >= 2:
+            filtered.append((idx, sc))
+
+    combined = filtered if filtered else combined
+
+    combined = [x for x in combined if x[1] > 0.25]
+
+
+    # ---------------------------
+    # RESULTS
+    # ---------------------------
+
+    results = []
+    seen = set()
+
+    for idx, sc in combined:
+
+        if idx in seen:
+            continue
+
+        seen.add(idx)
+        results.append((documents[idx], metadata[idx]))
+
+    # fallback
+    if len(results) == 0:
+        for _, idx in zip(D[0], I[0]):
+            if idx != -1 and idx < len(metadata):
+                results.append((documents[idx], metadata[idx]))
+
+    results = results[:3]
+
+
+    # ---------------------------
+    # CONTEXT BUILD
+    # ---------------------------
 
     context = ""
-
     sources = []
+    used = set()
 
-    for idx in I[0]:
+    for doc, meta in results:
 
-        context += documents[idx] + "\n\n"
+        src = meta.get("source", "")
 
-        sources.append(metadata[idx])
+        if src in used:
+            continue
 
-    # prompt
+        used.add(src)
+
+        context += f"\nBelge: {src}\n{doc}\n\n"
+        sources.append(meta)
+
+
+    # ---------------------------
+    # PROMPT
+    # ---------------------------
+
     prompt = f"""
-SADECE TÜRKÇE cevap ver.
+Sen üniversite belge asistanısın.
 
-Sadece verilen üniversite dokümanlarını kullan.
+Kurallar:
+- Sadece verilen metni kullan
+- Uydurma yapma
+- Kaynak dışına çıkma
+- Yoksa: "Bu bilgi belgelerde bulunamadı"
 
-Eğer cevap dokümanlarda yoksa:
-"Bu bilgi dokümanlarda bulunamadı."
-de.
-
-BAĞLAM:
+Metin:
 {context}
 
-SORU:
+Soru:
 {query}
+
+Cevap:
 """
 
-    # ollama
+
+    # ---------------------------
+    # LLM
+    # ---------------------------
+
     response = ollama.chat(
         model="mistral",
-        messages=[
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ]
+        messages=[{"role": "user", "content": prompt}]
     )
 
     answer = response["message"]["content"]
 
-    # save
-    save_message(chat_id, "user", query)
 
-    save_message(
-        chat_id,
-        "assistant",
-        answer,
-        sources
-    )
+    # ---------------------------
+    # CLEAN OUTPUT
+    # ---------------------------
+
+    lines = []
+    seen_lines = set()
+
+    for line in answer.split("\n"):
+        line = line.strip()
+        if len(line) < 3:
+            continue
+        if line in seen_lines:
+            continue
+        seen_lines.add(line)
+        lines.append(line)
+
+    answer = "\n".join(lines)
+
+
+    # ---------------------------
+    # SAVE + RERUN
+    # ---------------------------
+
+    save_message(chat_id, "assistant", answer, sources)
 
     st.rerun()
